@@ -488,11 +488,165 @@ const {
     - 参数：stats 对象，包含编译过程中的各类统计信息
     - 示例：webpack-bundle-analyzer 插件基于此钩子实现打包分析
 
+这是我总结的钩子的三个学习要素：触发时机、传递参数、示例代码。
+
+### 触发时机
+
+触发时机与 webpack 工作过程紧密相关，大体上从启动到结束，compiler 对象逐次触发如下钩子：
+
+![Alt text](./img/o.png)
+
+而 compilation 对象逐次触发：
+
+![Alt text](./img/p.png)
+
+所以，理解清楚前面说的 webpack 工作的主流程，基本上就可以捋清楚“什么时候会触发什么钩子”。
+
+### 参数
+
+传递参数与具体的钩子强相关，官网对这方面没有做出进一步解释，我的做法是直接在源码里面搜索调用语句，例如对于 compilation.hooks.optimizeTree ，可以在 webpack 源码中搜索 hooks.optimizeTree.call 关键字，就可以找到调用代码：
+
+```js
+// lib/compilation.js#2297
+this.hooks.optimizeTree.callAsync(this.chunks, this.modules, err => {
+});
+```
+
+结合代码所在的上下文，可以判断出此时传递的是经过优化的 chunks 及 modules 集合。
+
+### 找到示例
+
+Webpack 的钩子复杂程度不一，我认为最好的学习方法还是带着目的去查询其他插件中如何使用这些钩子。例如，在 compilation.seal 函数内部有 optimizeModules 和 afterOptimizeModules 这一对看起来很对偶的钩子，optimizeModules 从字面上可以理解为用于优化已经编译出的 modules ，那 afterOptimizeModules 呢？
+
+从 webpack 源码中唯一搜索到的用途是 ProgressPlugin ，大体上逻辑如下：
+
+```js
+compilation.hooks.afterOptimizeModules.intercept({
+  name: "ProgressPlugin",
+  call() {
+    handler(percentage, "sealing", title);
+  },
+  done() {
+    progressReporters.set(compiler, undefined);
+    handler(percentage, "sealing", title);
+  },
+  result() {
+    handler(percentage, "sealing", title);
+  },
+  error() {
+    handler(percentage, "sealing", title);
+  },
+  tap(tap) {
+    // p is percentage from 0 to 1
+    // args is any number of messages in a hierarchical matter
+    progressReporters.set(compilation.compiler, (p, ...args) => {
+      handler(percentage, "sealing", title, tap.name, ...args);
+    });
+    handler(percentage, "sealing", title, tap.name);
+  }
+});
+```
+
+基本上可以猜测出，afterOptimizeModules 的设计初衷就是用于通知优化行为的结束。
+
+apply 虽然是一个函数，但是从设计上就只有输入，webpack 不 care 输出，所以在插件中只能通过调用类型实体的各种方法来或者更改实体的配置信息，变更编译行为。例如：
+
+  - compilation.addModule ：添加模块，可以在原有的 module 构建规则之外，添加自定义模块
+  - compilation.emitAsset：直译是“提交资产”，功能可以理解将内容写入到特定路径
+
+到这里，插件的工作机理和写法已经有一个很粗浅的介绍了，回头单拎出来细讲吧。
+
+### How: 如何影响编译状态
+
+解决上述两个问题之后，我们就能理解“如何将特定逻辑插入 webpack 编译过程”，接下来才是重点 —— 如何影响编译状态？强调一下，webpack 的插件体系与平常所见的 订阅/发布 模式差别很大，是一种非常强耦合的设计，hooks 回调由 webpack 决定何时，以何种方式执行；而在 hooks 回调内部可以通过修改状态、调用上下文 api 等方式对 webpack 产生 side effect。
+
+比如，EntryPlugin 插件：
+
+```js
+class EntryPlugin {
+  apply(compiler) {
+    compiler.hooks.compilation.tap(
+      "EntryPlugin",
+      (compilation, { normalModuleFactory }) => {
+        compilation.dependencyFactories.set(
+          EntryDependency,
+          normalModuleFactory
+        );
+      }
+    );
+
+    compiler.hooks.make.tapAsync("EntryPlugin", (compilation, callback) => {
+      const { entry, options, context } = this;
+
+      const dep = EntryPlugin.createDependency(entry, options);
+      compilation.addEntry(context, dep, options, (err) => {
+        callback(err);
+      });
+    });
+  }
+}
+```
+
+上述代码片段调用了两个影响 compilation 对象状态的接口：
+
+  - compilation.dependencyFactories.set
+  - compilation.addEntry
+
+操作的具体含义可以先忽略，这里要理解的重点是，webpack 会将上下文信息以参数或 this (compiler 对象) 形式传递给钩子回调，在回调中可以调用上下文对象的方法或者直接修改上下文对象属性的方式，对原定的流程产生 side effect。所以想纯熟地编写插件，除了要理解调用时机，还需要了解我们可以用哪一些api，例如：
+
++ compilation.addModule：添加模块，可以在原有的 module 构建规则之外，添加自定义模块
++ compilation.emitAsset：直译是“提交资产”，功能可以理解将内容写入到特定路径
++ compilation.addEntry：添加入口，功能上与直接定义 entry 配置相同
++ module.addError：添加编译错误信息
+...
 
 
+## Loader 介绍
 
+Loader 的作用和实现比较简单，容易理解，所以简单介绍一下就行了。回顾 loader 在编译流程中的生效的位置：
 
+![Alt text](./img/q.png)
 
+流程图中， runLoaders 会调用用户所配置的 loader 集合读取、转译资源，此前的内容可以千奇百怪，但转译之后理论上应该输出标准 JavaScript 文本或者 AST 对象，webpack 才能继续处理模块依赖。
+
+理解了这个基本逻辑之后，loader 的职责就比较清晰了，不外乎是将内容 A 转化为内容 B，但是在具体用法层面还挺多讲究的，有 pitch、pre、post、inline 等概念用于应对各种场景。
+
+为了帮助理解，这里补充一个示例：Webpack 案例 -- vue-loader 原理分析。
+
+## 附录
+
+### 源码阅读技巧
+
++ **避重就轻：**挑软柿子捏，比如初始化过程虽然绕，但是相对来说是概念最少、逻辑最清晰的，那从这里入手摸清整个工作过程，可以习得 webpack 的一些通用套路，例如钩子的设计与作用、编码规则、命名习惯、内置插件的加载逻辑等，相当于先入了个门
+
++ **学会调试：**多用 ndb 单点调试功能追踪程序的运行，虽然 node 的调试有很多种方法，但是我个人更推荐 ndb ，灵活、简单，配合 debugger 语句是大杀器
+
++ **理解架构：**某种程度上可以将 webpack 架构简化为 compiler + compilation + plugins ，webpack 运行过程中只会有一个 compiler ；而每次编译 —— 包括调用 compiler.run 函数或者 watch = true 时文件发生变更，都会创建一个 compilation 对象。理解这三个核心对象的设计、职责、协作，差不多就能理解 webpack 的核心逻辑了
+
++ 抓大放小： plugin 的关键是“钩子”，我建议战略上重视，战术上忽视！钩子毕竟是 webpack 的关键概念，是整个插件机制的根基，学习 webpack 根本不可能绕过钩子，但是相应的逻辑跳转实在太绕太不直观了，看代码的时候一直揪着这个点的话，复杂性会剧增，我的经验是：
+
+  - 认真看一下 tapable 仓库的文档，或者粗略看一下 tapable 的源码，理解同步钩子、异步钩子、promise 钩子、串行钩子、并行钩子等概念，对 tapable 提供的事件模型有一个较为精细的认知，这叫战略上重视
+
+  - 遇到不懂的钩子别慌，我的经验我连这个类都不清楚干啥的，要去理解这些钩子实在太难了，不如先略过钩子本身的含义，去看那些插件用到了它，然后到插件哪里去加 debugger 语句单点调试，等你缕清后续逻辑的时候，大概率你也知道钩子的含义了，这叫战术上忽视
+
++ **保持好奇心：**学习过程保持旺盛的好奇心和韧性，善于 & 敢于提出问题，然后基于源码和社区资料去总结出自己的答案，问题可能会很多，比如：
+  - loader 为什么要设计 pre、pitch、post、inline？
+  - compilation.seal 函数内部设计了很多优化型的钩子，为什么需要区分的这么细？webpack 设计者对不同钩子有什么预期？
+  - 为什么需要那么多 module 子类？这些子类分别在什么时候被使用？
+
+## Module 与 Module 子类
+
+从上文可以看出，webpack 构建阶段的核心流程基本上都围绕着 module 展开，相信接触过、用过 Webpack 的读者对 module 应该已经有一个感性认知，但是实现上 module 的逻辑是非常复杂繁重的。
+
+以 webpack@5.26.3 为例，直接或间接继承自 Module (webpack/lib/Module.js 文件) 的子类有54个：
+
+无法复制加载中的内容
+
+要一个一个捋清楚这些类的作用实在太累了，我们需要抓住本质：module 的作用是什么？
+
+module 是 webpack 资源处理的基本单位，可以认为 webpack 对资源的路径解析、读入、转译、分析、打包输出，所有操作都是围绕着 module 展开的。有很多文章会说 module = 文件， 其实这种说法并不准确，比如子类 AsyncModuleRuntimeModule 就只是一段内置的代码，是一种资源而不能简单等价于实际文件。
+
+Webpack 扩展性很强，包括模块的处理逻辑上，比如说入口文件是一个普通的 js，此时首先创建 NormalModule 对象，在解析 AST 时发现这个文件里还包含了异步加载语句，例如 requere.ensure ，那么相应地会创建 AsyncModuleRuntimeModule 模块，注入异步加载的模板代码。上面类图的 54 个 module 子类都是为适配各种场景设计的。
 
 
 
